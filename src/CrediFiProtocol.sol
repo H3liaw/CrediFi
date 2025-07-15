@@ -184,6 +184,17 @@ contract CrediFiProtocol is Ownable, ReentrancyGuard {
         
         emit InterestAdded(MATIC, amount);
     }
+
+    /*//////////////////////////////////////////////////////////////
+                            VIEW FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+       /**
+     * @dev Get total reserves for an asset
+     */
+    function getTotalReserves(address asset) external view returns (uint256) {
+        return totalReserves[asset];
+    }
     
     /*//////////////////////////////////////////////////////////////
                             RECEIVE FUNCTIONS
