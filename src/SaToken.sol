@@ -5,7 +5,7 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 /**
  * @title SaToken
  * @dev SaToken is a rebasing ERC20 token that represents shares in the CrediFi protocol.
- * It is also used to track the value of the shares in the CrediFi protocol.
+ * It is used to track the value of the underlying asset and the shares in the CrediFi protocol.
  */
 contract SaToken is ERC20, Ownable {
     

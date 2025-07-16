@@ -55,7 +55,6 @@ Rebasing ERC20 tokens that represent shares in the lending pools:
 ### Prerequisites
 
 - [Foundry](https://getfoundry.sh/)
-- Node.js (for testing and deployment scripts)
 
 ### Installation
 
