@@ -21,19 +21,20 @@ contract CrediFiProtocol is Ownable, ReentrancyGuard, Pausable {
     address public immutable USDC;
     address public immutable MATIC;
     
-    SaToken public saETH;
-    SaToken public saUSDC;
-    SaToken public saMATIC;
     
     mapping(address => uint256) public totalReserves;
     mapping(address => uint256) public totalBorrowed;
     mapping(address => uint256) public accumulatedInterest;
+    mapping(address => SaToken) public saTokens;
+    mapping(address => bool) public supportedAssets;
+    mapping(address => CreditProfile) public creditProfiles;
+    mapping(address => BorrowPosition[]) public borrowPositions;
+
     
     uint256 public constant BASE_INTEREST_RATE = 500; // 5% base rate
     uint256 public constant CREDIT_DISCOUNT_RATE = 10; // 0.1% discount per 100 credit score points
     uint256 public constant LATE_PENALTY_RATE = 1000; // 10% penalty rate
     
-    // Credit system variables
     struct CreditProfile {
         uint256 score;              // Credit score (100-1000)
         uint256 totalBorrowed;      // Total borrowed amount (lifetime)
@@ -57,8 +58,8 @@ contract CrediFiProtocol is Ownable, ReentrancyGuard, Pausable {
         bool isActive;              // Whether position is active
     }
     
-    mapping(address => CreditProfile) public creditProfiles;
-    mapping(address => BorrowPosition[]) public borrowPositions;
+
+    
     
     uint256 public constant DEFAULT_CREDIT_SCORE = 300;
     uint256 public constant MIN_CREDIT_SCORE = 100;
@@ -66,6 +67,7 @@ contract CrediFiProtocol is Ownable, ReentrancyGuard, Pausable {
     uint256 public constant LOAN_DURATION = 30 days;
     uint256 public constant LIQUIDATION_THRESHOLD = 95; // 95% of collateral value
     uint256 public constant PROTOCOL_FEE = 50; // 0.5% protocol fee
+    
     
     mapping(address => uint256) public maxBorrowLimit; // Per-asset borrow limits
     uint256 public globalBorrowLimit = 10000000 * 10**6; // 10M USDC equivalent
@@ -96,8 +98,10 @@ contract CrediFiProtocol is Ownable, ReentrancyGuard, Pausable {
     );
     event CreditScoreUpdated(address indexed user, uint256 oldScore, uint256 newScore);
     event Liquidation(address indexed user, uint256 positionIndex, address indexed liquidator);
+    event AssetAdded(address indexed asset, address indexed saToken, uint256 borrowLimit);
+    event AssetRemoved(address indexed asset);
     event BorrowLimitUpdated(address indexed asset, uint256 newLimit);
-    
+
     /*//////////////////////////////////////////////////////////////
                             MODIFIERS
     //////////////////////////////////////////////////////////////*/
@@ -108,10 +112,7 @@ contract CrediFiProtocol is Ownable, ReentrancyGuard, Pausable {
     }
     
     modifier validAsset(address asset) {
-        require(
-            asset == ETH_ADDRESS || asset == USDC || asset == MATIC,
-            "Unsupported asset"
-        );
+        require(supportedAssets[asset], "Unsupported asset");
         _;
     }
     
@@ -122,10 +123,14 @@ contract CrediFiProtocol is Ownable, ReentrancyGuard, Pausable {
     constructor(address _usdc, address _matic) Ownable(msg.sender) {
         USDC = _usdc;
         MATIC = _matic;
+
+        saTokens[ETH_ADDRESS] = new SaToken("Share ETH", "saETH", ETH_ADDRESS, address(this));
+        saTokens[USDC] = new SaToken("Share USDC", "saUSDC", USDC, address(this));
+        saTokens[MATIC] = new SaToken("Share MATIC", "saMATIC", MATIC, address(this));
         
-        saETH = new SaToken("Share ETH", "saETH", ETH_ADDRESS, address(this));
-        saUSDC = new SaToken("Share USDC", "saUSDC", USDC, address(this));
-        saMATIC = new SaToken("Share MATIC", "saMATIC", MATIC, address(this));
+        supportedAssets[ETH_ADDRESS] = true;
+        supportedAssets[USDC] = true;
+        supportedAssets[MATIC] = true;
         
         maxBorrowLimit[ETH_ADDRESS] = 1000 ether;
         maxBorrowLimit[USDC] = 5000000 * 10**6; // 5M USDC
@@ -136,81 +141,139 @@ contract CrediFiProtocol is Ownable, ReentrancyGuard, Pausable {
                             DEPOSIT FUNCTIONS
     //////////////////////////////////////////////////////////////*/
     
-    function depositETH() external payable nonReentrant whenNotPaused {
-        require(msg.value > 0, "Amount must be greater than 0");
+      /**
+     * @dev Single deposit function - no WETH conversion
+     * @param asset ETH_ADDRESS for ETH, token address for ERC20
+     * @param amount Amount for ERC20 (0 for ETH, use msg.value)
+     */
+    function deposit(address asset, uint256 amount) 
+        external 
+        payable 
+        nonReentrant 
+        whenNotPaused 
+        validAsset(asset) 
+    {
+        uint256 depositAmount;
         
-        uint256 shares = saETH.mint(msg.sender, msg.value);
-        totalReserves[ETH_ADDRESS] += msg.value;
+        if (asset == ETH_ADDRESS) {
+            require(msg.value > 0, "ETH amount must be greater than 0");
+            require(amount == 0, "Amount should be 0 for ETH deposits");
+            if(msg.value > amount) payable(msg.sender).transfer(msg.value - amount);
+            depositAmount = msg.value;
+            
+        } else {
+            require(amount > 0, "Amount must be greater than 0");
+            require(msg.value == 0, "No ETH should be sent for ERC20 deposits");
+            
+            ERC20(asset).transferFrom(msg.sender, address(this), amount);
+            depositAmount = amount;
+        }
         
-        emit Deposit(msg.sender, ETH_ADDRESS, msg.value, shares);
+        uint256 shares = saTokens[asset].mint(msg.sender, depositAmount);
+        totalReserves[asset] += depositAmount;
+        
+        emit Deposit(msg.sender, asset, depositAmount, shares);
     }
     
-    function depositUSDC(uint256 amount) external nonReentrant whenNotPaused {
-        require(amount > 0, "Amount must be greater than 0");
-        
-        ERC20(USDC).transferFrom(msg.sender, address(this), amount);
-        
-        uint256 shares = saUSDC.mint(msg.sender, amount);
-        totalReserves[USDC] += amount;
-        
-        emit Deposit(msg.sender, USDC, amount, shares);
-    }
-    
-    function depositMATIC(uint256 amount) external nonReentrant whenNotPaused {
-        require(amount > 0, "Amount must be greater than 0");
-        
-        ERC20(MATIC).transferFrom(msg.sender, address(this), amount);
-        
-        uint256 shares = saMATIC.mint(msg.sender, amount);
-        totalReserves[MATIC] += amount;
-        
-        emit Deposit(msg.sender, MATIC, amount, shares);
-    }
-    
-    /*//////////////////////////////////////////////////////////////
-                            WITHDRAW FUNCTIONS
-    //////////////////////////////////////////////////////////////*/
-    
-    function withdrawETH(uint256 shares) external nonReentrant {
+    /**
+     * @dev Single withdraw function - no WETH conversion
+     * @param asset ETH_ADDRESS for ETH, token address for ERC20
+     * @param shares Amount of shares to burn
+     */
+    function withdraw(address asset, uint256 shares) 
+        external 
+        nonReentrant 
+        validAsset(asset) 
+    {
         require(shares > 0, "Shares must be greater than 0");
         
-        uint256 assets = saETH.burn(msg.sender, shares);
-        uint256 availableLiquidity = getAvailableLiquidity(ETH_ADDRESS);
-        require(availableLiquidity >= assets, "Insufficient ETH liquidity");
+        uint256 assets = saTokens[asset].burn(msg.sender, shares);
+        uint256 availableLiquidity = getAvailableLiquidity(asset);
+        require(availableLiquidity >= assets, "Insufficient liquidity");
         
-        totalReserves[ETH_ADDRESS] -= assets;
+        totalReserves[asset] -= assets;
         
-        payable(msg.sender).transfer(assets);
+        if (asset == ETH_ADDRESS) {
+            payable(msg.sender).transfer(assets);
+        } else {
+            ERC20(asset).transfer(msg.sender, assets);
+        }
         
-        emit Withdraw(msg.sender, ETH_ADDRESS, assets, shares);
+        emit Withdraw(msg.sender, asset, assets, shares);
+    }
+
+    /**
+     * @dev Add a new supported asset with its saToken
+     * @param asset Address of the asset (use address(0) for ETH)
+     * @param name Name for the saToken (e.g., "Share USDT")
+     * @param symbol Symbol for the saToken (e.g., "saUSDT")
+     * @param borrowLimit Maximum amount that can be borrowed for this asset
+     */
+    function addSupportedAsset(
+        address asset,
+        string memory name,
+        string memory symbol,
+        uint256 borrowLimit
+    ) external onlyOwner {
+        require(!supportedAssets[asset], "Asset already supported");
+        require(borrowLimit > 0, "Borrow limit must be greater than 0");
+        require(bytes(name).length > 0, "Name cannot be empty");
+        require(bytes(symbol).length > 0, "Symbol cannot be empty");
+        
+        if (asset != ETH_ADDRESS) {
+            require(asset != address(0), "Invalid asset address");
+            
+            try ERC20(asset).totalSupply() returns (uint256) {
+            } catch {
+                revert("Invalid ERC20 token");
+            }
+            
+            try ERC20(asset).decimals() returns (uint8) {
+            } catch {
+                revert("Token missing decimals function");
+            }
+        }
+        
+        SaToken newSaToken = new SaToken(name, symbol, asset, address(this));
+        
+        saTokens[asset] = newSaToken;
+        supportedAssets[asset] = true;
+        maxBorrowLimit[asset] = borrowLimit;
+        
+        emit AssetAdded(asset, address(newSaToken), borrowLimit);
     }
     
-    function withdrawUSDC(uint256 shares) external nonReentrant {
-        require(shares > 0, "Shares must be greater than 0");
+    /**
+     * @dev Remove a supported asset (only if no active positions)
+     * @param asset Address of the asset to remove
+     */
+    function removeSupportedAsset(address asset) external onlyOwner {
+        require(supportedAssets[asset], "Asset not supported");
+        require(asset != ETH_ADDRESS, "Cannot remove ETH");
+        require(asset != USDC, "Cannot remove initial assets");
+        require(asset != MATIC, "Cannot remove initial assets");
+        require(totalReserves[asset] == 0, "Asset has active reserves");
+        require(totalBorrowed[asset] == 0, "Asset has active borrows");
         
-        uint256 assets = saUSDC.burn(msg.sender, shares);
-        uint256 availableLiquidity = getAvailableLiquidity(USDC);
-        require(availableLiquidity >= assets, "Insufficient USDC liquidity");
+        delete supportedAssets[asset];
+        delete maxBorrowLimit[asset];
+        delete saTokens[asset];
         
-        totalReserves[USDC] -= assets;
-        
-        ERC20(USDC).transfer(msg.sender, assets);
-        
-        emit Withdraw(msg.sender, USDC, assets, shares);
+        emit AssetRemoved(asset);
     }
     
-    function withdrawMATIC(uint256 shares) external nonReentrant {
-        require(shares > 0, "Shares must be greater than 0");
+    /**
+     * @dev Update borrow limit for an existing asset
+     * @param asset Address of the asset
+     * @param newLimit New borrow limit
+     */
+    function updateBorrowLimit(address asset, uint256 newLimit) external onlyOwner {
+        require(supportedAssets[asset], "Asset not supported");
+        require(newLimit > 0, "Limit must be greater than 0");
         
-        uint256 assets = saMATIC.burn(msg.sender, shares);
-        uint256 availableLiquidity = getAvailableLiquidity(MATIC);
-        require(availableLiquidity >= assets, "Insufficient MATIC liquidity");
+        maxBorrowLimit[asset] = newLimit;
         
-        totalReserves[MATIC] -= assets;
-        
-        ERC20(MATIC).transfer(msg.sender, assets);
-        
-        emit Withdraw(msg.sender, MATIC, assets, shares);
+        emit BorrowLimitUpdated(asset, newLimit);
     }
     
     /*//////////////////////////////////////////////////////////////
@@ -251,13 +314,13 @@ contract CrediFiProtocol is Ownable, ReentrancyGuard, Pausable {
         
         require(totalBorrowed[borrowAsset] + borrowAmount <= maxBorrowLimit[borrowAsset], "Asset borrow limit exceeded");
         
-        // TODO: Implement price oracle to get USD values
+        // TODO: Price oracle to get USD values
         // uint256 borrowValueUSD = oracle.getPrice(borrowAsset) * borrowAmount;
         // require(getTotalBorrowedValueUSD() + borrowValueUSD <= globalBorrowLimit, "Global borrow limit exceeded");
         
         uint256 requiredRatio = getCollateralRatio(msg.sender);
         
-        // TODO: Use oracle prices for cross-asset collateral calculation
+        // TODO: Need oracle prices for cross-asset collateral calculation
         // uint256 borrowValue = oracle.getPrice(borrowAsset) * borrowAmount;
         // uint256 requiredCollateralValue = (borrowValue * requiredRatio) / 100;
         // uint256 collateralValue = oracle.getPrice(collateralAsset) * collateralAmount;
@@ -267,7 +330,7 @@ contract CrediFiProtocol is Ownable, ReentrancyGuard, Pausable {
             uint256 requiredCollateral = (borrowAmount * requiredRatio) / 10000;
             require(collateralAmount >= requiredCollateral, "Insufficient collateral");
         } else {
-            // TODO: Remove this restriction when oracle is implemented
+            // TODO: Need to remove this, when oracle is implemented
             revert("Cross-asset collateral requires price oracle");
         }
         
@@ -381,6 +444,7 @@ contract CrediFiProtocol is Ownable, ReentrancyGuard, Pausable {
             position.isActive = false;
         } else {
             creditProfiles[msg.sender].totalRepaid += actualRepayAmount;
+            
         }
         
         emit Repay(msg.sender, positionIndex, principalPaid, interestPaid, isFullyRepaid);
@@ -393,7 +457,7 @@ contract CrediFiProtocol is Ownable, ReentrancyGuard, Pausable {
         require(position.isActive, "Position not active");
         require(block.timestamp > position.dueDate, "Position not yet liquidatable");
         
-        // TODO: Implement proper liquidation with oracle prices
+        // TODO: Need to implement proper liquidation with oracle prices
         // uint256 borrowValue = oracle.getPrice(position.borrowedAsset) * position.borrowedAmount;
         // uint256 collateralValue = oracle.getPrice(position.collateralAsset) * position.collateralAmount;
         // require(collateralValue < (borrowValue * LIQUIDATION_THRESHOLD) / 100, "Position still healthy");
@@ -401,7 +465,7 @@ contract CrediFiProtocol is Ownable, ReentrancyGuard, Pausable {
         uint256 timeElapsed = block.timestamp - position.borrowTime;
         uint256 interest = (position.borrowedAmount * position.interestRate * timeElapsed) / (365 days * 10000);
         uint256 totalDebt = position.borrowedAmount + interest;
-        
+
         if (position.borrowedAsset == ETH_ADDRESS) {
             require(msg.value >= totalDebt, "Insufficient ETH sent");
             if (msg.value > totalDebt) {
@@ -461,11 +525,11 @@ contract CrediFiProtocol is Ownable, ReentrancyGuard, Pausable {
         totalReserves[asset] += lenderInterest;
         
         if (asset == ETH_ADDRESS) {
-            saETH.rebase(totalReserves[ETH_ADDRESS]);
+            saTokens[ETH_ADDRESS].rebase(totalReserves[ETH_ADDRESS]);
         } else if (asset == USDC) {
-            saUSDC.rebase(totalReserves[USDC]);
+            saTokens[USDC].rebase(totalReserves[USDC]);
         } else if (asset == MATIC) {
-            saMATIC.rebase(totalReserves[MATIC]);
+            saTokens[MATIC].rebase(totalReserves[MATIC]);
         }
         
         emit InterestDistributed(asset, lenderInterest);
