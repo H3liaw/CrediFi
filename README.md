@@ -110,11 +110,8 @@ forge build
 # Run all tests
 forge test
 
-# Run tests with verbose output
-forge test -vvv
-
-# Run specific test file
-forge test --match-contract CrediFiProtocol
+# Generate HTML coverage report
+forge coverage --report lcov && genhtml lcov.info --output-directory coverage
 ```
 
 ## Contributing
