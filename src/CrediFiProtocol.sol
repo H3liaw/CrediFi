@@ -158,7 +158,6 @@ contract CrediFiProtocol is Ownable, ReentrancyGuard, Pausable {
         if (asset == ETH_ADDRESS) {
             require(msg.value > 0, "ETH amount must be greater than 0");
             require(amount == 0, "Amount should be 0 for ETH deposits");
-            if(msg.value > amount) payable(msg.sender).transfer(msg.value - amount);
             depositAmount = msg.value;
             
         } else {
